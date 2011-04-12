@@ -1,0 +1,126 @@
+JETTY_HOME = "/opt/jetty"
+deploy_dir = Time.now.strftime("%Y-%m-%d-%H-%M-%S")
+webapps_path = "#{JETTY_HOME}/deploy/#{deploy_dir}"
+run_dir = "#{JETTY_HOME}/run"
+old_jetty_port = 9090
+new_jetty_port = 9091
+config_prefix = "/etc/nginx/sites-available"
+site_files = ["app.example.com"]
+old_pid_file = "#{JETTY_HOME}/run/pid/jetty.pid"
+
+def force_symlink(existing, link)
+  #FileUtils.ln_s doesn't support the "no dereference option (-n in the shell)
+  system("ln -snf \"#{existing}\" \"#{link}\"")
+end
+
+def write_file(path, contents)
+  File.open(path, "w+") do |f|
+    f.puts contents
+  end
+end
+
+task :run_pid => [:setup_old_pid] do
+  pid_dir = "#{run_dir}/#{deploy_dir}"
+  FileUtils.mkdir_p pid_dir
+
+  force_symlink pid_dir, "#{run_dir}/pid"
+
+  clean_dir = File.dirname(pid_dir)
+  trim_all_but_last_five(clean_dir)
+end
+
+def trim_all_but_last_five(dir)
+  children = Dir[dir + "/*"]
+  children.sort! do |a, b|
+    first = File.new(a)
+    second = File.new(b)
+    first.mtime <=> second.mtime
+  end
+
+  victims = children.reverse.drop(5)
+  victims.each { |v| FileUtils.rm_rf v }
+end
+
+task :setup_webapps do
+  FileUtils.mkdir_p webapps_path
+  
+  FileUtils.cp Dir["#{JETTY_HOME}/source-webapps/*"], webapps_path
+  force_symlink webapps_path, "#{JETTY_HOME}/webapps"
+  
+  old_dir = File.dirname(webapps_path)
+  trim_all_but_last_five(old_dir)
+end
+
+task :setup_ports do
+  config_text = File.read("#{JETTY_HOME}/bin/config.sh")
+  old_jetty_port = config_text.match(/JETTY_PORT=(\d+)/)[1].to_i
+  if old_jetty_port == 9090
+    new_jetty_port = 9091
+  else
+    new_jetty_port = 9090
+  end
+
+  puts "Switching ports from #{old_jetty_port} to #{new_jetty_port}"
+end
+
+task :setup_old_pid do
+  old_pid_dir = `readlink #{JETTY_HOME}/run/pid`
+  old_pid_file = "#{old_pid_dir.strip}/jetty.pid"
+end
+
+task :start_new => [:setup_webapps, :setup_ports, :run_pid] do
+  config_path = "#{JETTY_HOME}/bin/config.sh"
+  config_text = File.read(config_path)
+  new_config = config_text.gsub(/JETTY_PORT=(\d+)/, "JETTY_PORT=#{new_jetty_port}")
+  
+  write_file(config_path, new_config)
+  system("#{JETTY_HOME}/bin/jetty.sh start")
+end
+
+task :wait_for_new => [:start_new] do
+  require("net/http")
+  
+  while true do
+    puts "Waiting for new app to become available..."
+
+    uri = URI.parse("http://localhost:#{new_jetty_port}/")
+    body = ""
+    begin
+      body = Net::HTTP.get(uri)
+    rescue
+    end
+    
+    #puts "#{uri} -> #{body}"
+    break if body.match(/<\/html>/i)
+    sleep 1
+  end
+  
+  #Wait some more. Just in case.
+  sleep 3
+  puts "New app available."
+end
+
+task :reconfigure_nginx => [:setup_ports, :wait_for_new] do
+  site_files.each do |f|
+    config_path = File.join(config_prefix, f)
+    puts "Changing nginx config: #{config_path}"
+    
+    config_text = File.read(config_path)
+    new_config = config_text.gsub(/(proxy_pass.*):\d+/, "\\1:#{new_jetty_port}")
+    write_file(config_path, new_config)
+  end
+
+  puts "Reloading new nginx config."
+  system("killall -HUP nginx")
+end
+
+task :stop_old => [:run_pid, :wait_for_new] do
+  if File.exists?(old_pid_file)
+    puts "Stopping old jetty"
+    system("bin/stop.sh #{old_pid_file}")
+  end
+end
+
+task :default => [:start_new, :reconfigure_nginx, :stop_old] do
+  puts "Deployment done!"
+end
